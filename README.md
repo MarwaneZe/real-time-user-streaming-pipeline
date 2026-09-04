@@ -26,8 +26,6 @@
 - [▶️ Running the Pipeline](#️-running-the-pipeline)
 - [⚙️ How It Works](#️-how-it-works)
 - [🔧 Configuration](#-configuration)
-- [🧹 Resetting the Data](#-resetting-the-data)
-- [🔍 Troubleshooting](#-troubleshooting)
 
 ---
 
@@ -152,9 +150,7 @@ The run starts two tasks in parallel:
 | **`stream_data_from_api`** | Fetches one random user/second from the RandomUser API → publishes Avro to Kafka `users_created`. Runs for `PIPELINE_DURATION` seconds (default `60`), then finishes. |
 | **`spark_consumer`** | Submits `spark/jobs/spark_stream.py` to the Spark cluster → consumes, enriches, and writes in 5-second micro-batches until stopped. |
 
-### 🛑 Stop the consumer
 
-Open the DAG → **Graph view** → select `spark_consumer` → **Mark Failed**. The producer stops by itself after `PIPELINE_DURATION`.
 
 ### ✅ Verify the data
 
