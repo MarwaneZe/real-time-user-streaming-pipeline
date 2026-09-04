@@ -11,13 +11,16 @@
   all kicked off with one click in Airflow.
 </p>
 
+<p align="center">
+  <img src="docs/Architecture.png" alt="Pipeline architecture" width="800">
+</p>
+
 ---
 
 ## 📋 Table of Contents
 
 - [✨ Features](#-features)
 - [🏗️ Architecture](#-architecture)
-- [🖼️ Screenshots](#️-screenshots)
 - [🛠️ Tech Stack](#️-tech-stack)
 - [🚀 Quick Start](#-quick-start)
 - [▶️ Running the Pipeline](#️-running-the-pipeline)
@@ -41,7 +44,7 @@
 
 ## 🏗️ Architecture
 
-<!-- TODO: add architecture diagram → docs/images/architecture.png -->
+![Architecture diagram](docs/Architecture.png)
 
 ```
 randomuser.me API
@@ -66,14 +69,6 @@ randomuser.me API
 3. **MongoDB** stores the enriched documents in the `users` collection, replicated across a 3-node replica set for HA.
 
 > **High availability:** Kafka runs 2 broker+controller nodes plus a dedicated controller-only 3rd node, so a single broker loss keeps both data and the controller quorum. Internal topics and `users_created` replicate across both brokers (`replication.factor=2`).
-
----
-
-## 🖼️ Screenshots
-
-<!-- TODO: add Airflow DAG view screenshot → docs/images/screenshots/airflow.png -->
-<!-- TODO: add Kafka UI messages screenshot → docs/images/screenshots/kafka-ui.png -->
-<!-- TODO: add Mongo Express users collection screenshot → docs/images/screenshots/mongo-express.png -->
 
 ---
 
