@@ -1,0 +1,30 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+logs/
+logs-worker1/
+logs-worker2/
+kafka/data/
+kafka/data1/
+kafka/data2/
+*.jar
+
+# Local PySpark wheelhouse (430MB) - fetch via airflow/worker/download-pyspark-wheel.sh
+airflow/worker/wheels/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+
+# Tooling / caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+kafka/controller-data/

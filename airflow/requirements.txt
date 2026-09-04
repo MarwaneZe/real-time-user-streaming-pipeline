@@ -1,0 +1,7 @@
+# Airflow core and standard providers come from the base image.
+confluent-kafka[avro]
+requests
+
+# SparkSubmitOperator must be parseable by every component that loads the DAGs;
+# the heavier pyspark runtime is worker-only (requirements-worker.txt).
+apache-airflow-providers-apache-spark

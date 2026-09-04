@@ -1,0 +1,9 @@
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+Dockerfile
+
+# The PySpark wheelhouse is only needed by the worker image, which uses its own
+# context (airflow/worker). Exclude it from every other airflow build so the
+# shared images don't transfer ~450MB of wheel into their context.
+wheels/

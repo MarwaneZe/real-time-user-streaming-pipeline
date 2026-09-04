@@ -1,0 +1,8 @@
+# Copy of airflow/requirements.txt for the worker-only build context. Update
+# the canonical file first, then sync this copy.
+confluent-kafka[avro]
+requests
+
+# SparkSubmitOperator provider. Required by every DAG-parsing component and by
+# the worker that executes the Spark job.
+apache-airflow-providers-apache-spark

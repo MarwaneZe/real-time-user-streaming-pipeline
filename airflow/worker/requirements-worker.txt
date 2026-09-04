@@ -1,0 +1,7 @@
+# PySpark runtime, installed only on the airflow worker image (driver host in
+# client mode). Pinned to the cluster's Spark version (4.2.0).
+
+# The pinned pyspark wheel (~430 MB) lives in the local wheelhouse
+# (airflow/worker/wheels, gitignored). Fetch it with download-pyspark-wheel.sh
+# before the first `docker compose up -d --build`.
+pyspark==4.2.0

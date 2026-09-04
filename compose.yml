@@ -1,0 +1,841 @@
+x-airflow-common:
+  &airflow-common
+
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+
+  environment:
+    &airflow-common-env
+
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
+
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET}
+    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
+
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW__API__SECRET_KEY}
+
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+
+    PIPELINE_DURATION: ${PIPELINE_DURATION:-60}
+
+    KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-broker1:9092,broker2:9092}
+    KAFKA_TOPIC: ${KAFKA_TOPIC:-users_created}
+    MONGO_URI: mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-admin}@mongodb1:27017,mongodb2:27017,mongodb3:27017/?replicaSet=rs0&authSource=admin
+
+    SCHEMA_REGISTRY_URL: ${SCHEMA_REGISTRY_URL:-http://schema-registry:8081}
+
+    AIRFLOW_CONN_SPARK_DEFAULT: spark://spark-master:7077
+
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+
+    AIRFLOW_CONFIG: /opt/airflow/config/airflow.cfg
+
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+
+  user: "${AIRFLOW_UID:-50000}:0"
+
+  networks:
+    - data_net
+
+  depends_on:
+    &airflow-common-depends-on
+
+    redis:
+      condition: service_healthy
+
+    postgres:
+      condition: service_healthy
+
+x-mongodb-common: &mongodb-common
+  build:
+    context: ./mongo
+    dockerfile: Dockerfile
+  command:
+    - mongod
+    - --replSet
+    - rs0
+    - --bind_ip_all
+    - --keyFile
+    - /etc/mongodb-internal-keyfile
+    - --auth
+  environment:
+    # The official mongo entrypoint seeds the root user on first boot (fresh
+    # volume); mongodb-init then relies on it existing.
+    MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-admin}
+    MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-admin}
+    MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-admin}
+    MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-admin}
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - >-
+        mongosh --quiet mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-admin}@localhost:27017/admin?authSource=admin
+        --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)' || exit 1
+    interval: 10s
+    timeout: 5s
+    retries: 10
+    start_period: 20s
+  restart: always
+  deploy:
+    resources:
+      limits:
+        memory: 512m
+        cpus: '1'
+  networks:
+    - data_net
+
+x-spark-worker: &spark-worker
+  build:
+    context: ./spark
+    dockerfile: Dockerfile
+  command: >
+    /opt/spark/bin/spark-class
+    org.apache.spark.deploy.worker.Worker
+    spark://spark-master:7077
+  depends_on:
+    spark-master:
+      condition: service_started
+    kafka1:
+      condition: service_healthy
+    kafka2:
+      condition: service_healthy
+    mongodb-init:
+      condition: service_completed_successfully
+  environment: &spark-worker-env
+    SPARK_WORKER_CORES: 2
+    SPARK_WORKER_MEMORY: 2g
+    MONGO_URI: ${MONGO_URI:-mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-admin}@mongodb1:27017,mongodb2:27017,mongodb3:27017/?replicaSet=rs0&authSource=admin}
+    KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-broker1:9092,broker2:9092}
+    KAFKA_TOPIC: ${KAFKA_TOPIC:-users_created}
+    SCHEMA_REGISTRY_URL: ${SCHEMA_REGISTRY_URL:-http://schema-registry:8081}
+    CHECKPOINT_LOCATION: /opt/spark/checkpoints/users
+  volumes:
+    - spark-checkpoints:/opt/spark/checkpoints
+  restart: always
+  deploy:
+    resources:
+      limits:
+        memory: 2g
+        cpus: '2'
+  networks:
+    - data_net
+
+x-airflow-worker: &airflow-worker
+  <<: *airflow-common
+  build:
+    context: ./airflow/worker
+    dockerfile: Dockerfile
+  command: celery worker
+  healthcheck:
+    test:
+      [
+        "CMD-SHELL",
+        "celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d \"celery@$${HOSTNAME}\" || celery --app airflow.executors.celery_executor.app inspect ping -d \"celery@$${HOSTNAME}\""
+      ]
+    interval: 30s
+    timeout: 10s
+    retries: 5
+    start_period: 30s
+  environment:
+    <<: *airflow-common-env
+    DUMB_INIT_SETSID: "0"
+  restart: always
+  deploy:
+    resources:
+      limits:
+        memory: 2g
+        cpus: '2'
+  networks:
+    - data_net
+
+services:
+  kafka1:
+    image: confluentinc/cp-kafka:8.3.1
+
+    hostname: broker1
+    container_name: kafka1_container
+
+    ports:
+      - "9094:9094"
+
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker1:9093,2@broker2:9093,3@kafka-controller:9093
+
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
+
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker1:9092,EXTERNAL://localhost:9094
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      CLUSTER_ID: EmptNWtoR4GGWx-BH6nGLQ
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 2
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_CONFLUENT_LICENSE_METRICS_REPORTER_TOPIC_REPLICATION_FACTOR: 2
+      KAFKA_CONFLUENT_METADATA_TOPIC_REPLICATION_FACTOR: 2
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 2
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+
+    volumes:
+      - ./kafka/data1:/var/lib/kafka/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+    restart: always
+
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: '1'
+
+    networks:
+      - data_net
+
+  kafka2:
+    image: confluentinc/cp-kafka:8.3.1
+
+    hostname: broker2
+    container_name: kafka2_container
+
+    environment:
+      KAFKA_NODE_ID: 2
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker1:9093,2@broker2:9093,3@kafka-controller:9093
+
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker2:9092
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      CLUSTER_ID: EmptNWtoR4GGWx-BH6nGLQ
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 2
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_CONFLUENT_LICENSE_METRICS_REPORTER_TOPIC_REPLICATION_FACTOR: 2
+      KAFKA_CONFLUENT_METADATA_TOPIC_REPLICATION_FACTOR: 2
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 2
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+
+    volumes:
+      - ./kafka/data2:/var/lib/kafka/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+    restart: always
+
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: '1'
+
+    networks:
+      - data_net
+
+  kafka-controller:
+    image: confluentinc/cp-kafka:8.3.1
+
+    hostname: kafka-controller
+    container_name: kafka_controller_container
+
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >-
+        if [ ! -d /var/lib/kafka/data/__cluster_metadata-0 ]; then
+          kafka-storage format -t EmptNWtoR4GGWx-BH6nGLQ -c /etc/kafka/controller.properties;
+        fi &&
+        exec kafka-server-start /etc/kafka/controller.properties
+
+    volumes:
+      - ./kafka/controller-data:/var/lib/kafka/data
+      - ./kafka/controller.properties:/etc/kafka/controller.properties:ro
+
+    restart: always
+
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '1'
+
+    networks:
+      - data_net
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:8.3.1
+
+    container_name: schema_registry_container
+    hostname: schema-registry
+
+    depends_on:
+      kafka1:
+        condition: service_healthy
+      kafka2:
+        condition: service_healthy
+
+    ports:
+      - "8081:8081"
+
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: broker1:9092,broker2:9092
+
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+
+    healthcheck:
+      # The image ships no curl/wget, so probe via bash /dev/tcp.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8081' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    restart: always
+
+    networks:
+      - data_net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+
+    hostname: kafka-ui
+    container_name: kafka_ui
+
+    ports:
+      - "8082:8080"
+
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: broker1:9092,broker2:9092
+
+    depends_on:
+      kafka1:
+        condition: service_healthy
+      kafka2:
+        condition: service_healthy
+
+      schema-registry:
+        condition: service_healthy
+
+    networks:
+      - data_net
+
+  postgres:
+    image: postgres:16
+
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+
+    restart: always
+
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: '1'
+
+    networks:
+      - data_net
+
+  redis:
+    image: redis:7.2-bookworm
+
+    expose:
+      - 6379
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+
+    restart: always
+
+    deploy:
+      resources:
+        limits:
+          memory: 500m
+          cpus: '0.5'
+
+    networks:
+      - data_net
+
+  mongodb1:
+    <<: *mongodb-common
+    hostname: mongodb1
+    container_name: mongodb1
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb1-data:/data/db
+
+  mongodb2:
+    <<: *mongodb-common
+    hostname: mongodb2
+    container_name: mongodb2
+    volumes:
+      - mongodb2-data:/data/db
+
+  mongodb3:
+    <<: *mongodb-common
+    hostname: mongodb3
+    container_name: mongodb3
+    volumes:
+      - mongodb3-data:/data/db
+
+  mongodb-init:
+    image: mongo:7.0
+    container_name: mongodb_init
+    depends_on:
+      mongodb1:
+        condition: service_started
+      mongodb2:
+        condition: service_started
+      mongodb3:
+        condition: service_started
+
+    entrypoint:
+      - /bin/bash
+      - /scripts/mongodb-init.sh
+
+    environment:
+      MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?MONGO_ROOT_USERNAME must be set in .env}
+      MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD must be set in .env}
+
+    volumes:
+      - ./docker/mongodb-init.sh:/scripts/mongodb-init.sh:ro
+
+    networks:
+      - data_net
+
+  mongo-express:
+    image: mongo-express:latest
+
+    container_name: mongo_express
+
+    depends_on:
+      mongodb-init:
+        condition: service_completed_successfully
+
+    environment:
+      ME_CONFIG_MONGODB_URL: mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-admin}@mongodb1:27017,mongodb2:27017,mongodb3:27017/?replicaSet=rs0&authSource=admin
+      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USERNAME:-admin}
+      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASSWORD:?MONGO_EXPRESS_PASSWORD must be set in .env}
+
+    ports:
+      - "8083:8081"
+
+    restart: always
+
+    networks:
+      - data_net
+
+  spark-master:
+    image: apache/spark:4.2.0-python3
+
+    container_name: spark-master
+    hostname: spark-master
+
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.master.Master
+
+    ports:
+      - "7077:7077"
+      - "8090:8080"
+
+    environment:
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8080
+
+    restart: always
+
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: '1'
+
+    networks:
+      - data_net
+
+  spark-worker1:
+    <<: *spark-worker
+    container_name: spark-worker1
+    hostname: spark-worker1
+    ports:
+      - "8091:8081"
+    environment:
+      <<: *spark-worker-env
+      SPARK_WORKER_WEBUI_PORT: 8081
+
+  spark-worker2:
+    <<: *spark-worker
+    container_name: spark-worker2
+    hostname: spark-worker2
+    environment:
+      <<: *spark-worker-env
+      SPARK_WORKER_WEBUI_PORT: 8081
+
+  airflow-apiserver:
+    <<: *airflow-common
+
+    command: api-server
+
+    ports:
+      - "8080:8080"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "--fail",
+          "http://localhost:8080/api/v2/monitor/health"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+    restart: always
+
+    depends_on:
+      <<: *airflow-common-depends-on
+
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+
+    command: scheduler
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+    restart: always
+
+    depends_on:
+      <<: *airflow-common-depends-on
+
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+
+    command: dag-processor
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "airflow jobs check --job-type DagProcessorJob --hostname \"$${HOSTNAME}\""
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+    restart: always
+
+    depends_on:
+      <<: *airflow-common-depends-on
+
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker1:
+    <<: *airflow-worker
+    container_name: airflow-worker1
+    hostname: airflow-worker1
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+      - ${AIRFLOW_PROJ_DIR:-.}/logs-worker1:/opt/airflow/logs
+      - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+      - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+      - ${AIRFLOW_PROJ_DIR:-.}/spark/jobs:/opt/airflow/sparkjobs:ro
+
+  airflow-worker2:
+    <<: *airflow-worker
+    container_name: airflow-worker2
+    hostname: airflow-worker2
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+      - ${AIRFLOW_PROJ_DIR:-.}/logs-worker2:/opt/airflow/logs
+      - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+      - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+      - ${AIRFLOW_PROJ_DIR:-.}/spark/jobs:/opt/airflow/sparkjobs:ro
+
+  airflow-triggerer:
+    <<: *airflow-common
+
+    command: triggerer
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "airflow jobs check --job-type TriggererJob --hostname \"$${HOSTNAME}\""
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+    restart: always
+
+    depends_on:
+      <<: *airflow-common-depends-on
+
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+
+    entrypoint: /bin/bash
+
+    command:
+      - -c
+      - |
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
+          echo "If you are on Linux, you SHOULD follow the instructions below to set "
+          echo "AIRFLOW_UID environment variable, otherwise files will be owned by root."
+          echo
+          export AIRFLOW_UID=$$(id -u)
+        fi
+
+        if [[ -z "${FERNET_KEY}" ]]; then
+          echo
+          echo -e "\033[1;31mERROR!!!: FERNET_KEY not set!\e[0m"
+          echo "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+          echo "and add it to your .env file."
+          exit 1
+        fi
+
+        if [[ -z "${AIRFLOW__API_AUTH__JWT_SECRET}" ]]; then
+          echo
+          echo -e "\033[1;31mERROR!!!: AIRFLOW__API_AUTH__JWT_SECRET not set!\e[0m"
+          echo "Add a value to your .env file."
+          exit 1
+        fi
+
+        if [[ -z "${AIRFLOW__API__SECRET_KEY}" ]]; then
+          echo
+          echo -e "\033[1;31mERROR!!!: AIRFLOW__API__SECRET_KEY not set!\e[0m"
+          echo "Add a value to your .env file."
+          exit 1
+        fi
+
+        if [[ -z "${MONGO_ROOT_PASSWORD}" ]]; then
+          echo
+          echo -e "\033[1;31mERROR!!!: MONGO_ROOT_PASSWORD not set!\e[0m"
+          echo "Add a value for MONGO_ROOT_PASSWORD to your .env file."
+          exit 1
+        fi
+
+        if [[ -z "${_AIRFLOW_WWW_USER_PASSWORD}" ]]; then
+          echo
+          echo -e "\033[1;31mERROR!!!: _AIRFLOW_WWW_USER_PASSWORD not set!\e[0m"
+          echo "Add a value for _AIRFLOW_WWW_USER_PASSWORD to your .env file."
+          exit 1
+        fi
+
+        one_meg=1048576
+
+        mem_available=$$(($$(getconf _PHYS_PAGES) * $$(getconf PAGE_SIZE) / one_meg))
+
+        cpus_available=$$(grep -cE 'cpu[0-9]+' /proc/stat)
+
+        disk_available=$$(df / | tail -1 | awk '{print $$4}')
+
+        warning_resources="false"
+
+        if (( mem_available < 4000 )); then
+          echo -e "\033[1;33mWARNING!!!: Not enough memory available for Docker.\e[0m"
+          warning_resources="true"
+        fi
+
+        if (( cpus_available < 2 )); then
+          echo -e "\033[1;33mWARNING!!!: Not enough CPUS available for Docker.\e[0m"
+          warning_resources="true"
+        fi
+
+        if (( disk_available < one_meg * 10 )); then
+          echo -e "\033[1;33mWARNING!!!: Not enough Disk space available for Docker.\e[0m"
+          warning_resources="true"
+        fi
+
+        if [[ $${warning_resources} == "true" ]]; then
+          echo -e "\033[1;33mWARNING!!!: You have not enough resources to run Airflow!\e[0m"
+        fi
+
+        echo "Creating missing opt dirs if missing:"
+
+        mkdir -v -p /opt/airflow/{logs,dags,plugins,config}
+
+        echo "Airflow version:"
+
+        /entrypoint airflow version
+
+        echo "Running airflow config list to create default config file if missing."
+
+        /entrypoint airflow config list >/dev/null
+
+        echo "Change ownership of files in /opt/airflow to ${AIRFLOW_UID:-50000}:0"
+
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/
+
+        echo "Initialization complete."
+
+    environment:
+      <<: *airflow-common-env
+
+      _AIRFLOW_DB_MIGRATE: 'true'
+
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:?_AIRFLOW_WWW_USER_PASSWORD must be set in .env}
+
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+
+    user: "0:0"
+
+  airflow-cli:
+    <<: *airflow-common
+
+    profiles:
+      - debug
+
+    environment:
+      <<: *airflow-common-env
+
+      CONNECTION_CHECK_MAX_COUNT: "0"
+
+    command:
+      - bash
+      - -c
+      - airflow
+
+    depends_on:
+      <<: *airflow-common-depends-on
+
+  flower:
+    <<: *airflow-common
+
+    command: celery flower
+
+    profiles:
+      - flower
+
+    ports:
+      - "5555:5555"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "--fail",
+          "http://localhost:5555/"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+    restart: always
+
+    depends_on:
+      <<: *airflow-common-depends-on
+
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-db-volume:
+  mongodb1-data:
+  mongodb2-data:
+  mongodb3-data:
+  spark-checkpoints:
+
+networks:
+  data_net:

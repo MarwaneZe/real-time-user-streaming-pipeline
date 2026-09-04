@@ -1,0 +1,19 @@
+{
+  "type": "record",
+  "name": "User",
+  "namespace": "de.project.users",
+  "fields": [
+    { "name": "id", "type": "string" },
+    { "name": "first_name", "type": "string" },
+    { "name": "last_name", "type": "string" },
+    { "name": "gender", "type": "string" },
+    { "name": "address", "type": "string" },
+    { "name": "post_code", "type": "string" },
+    { "name": "email", "type": "string" },
+    { "name": "username", "type": "string" },
+    { "name": "dob", "type": { "type": "long", "logicalType": "timestamp-millis" } },
+    { "name": "registered_date", "type": { "type": "long", "logicalType": "timestamp-millis" } },
+    { "name": "phone", "type": "string" },
+    { "name": "picture", "type": "string" }
+  ]
+}
