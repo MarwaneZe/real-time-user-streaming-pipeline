@@ -46,22 +46,6 @@
 
 ![Architecture diagram](docs/Architecture.png)
 
-```
-randomuser.me API
-      │  fetch user (HTTP)
-      ▼
-┌─────────────┐   users_created topic (Avro)   ┌──────────────────────┐   spark-submit   ┌──────────────┐
-│   Airflow   │ ─────────────────────────────► │ Kafka ×2 + controller │ ───────────────► │   Spark      │
-│  (producer) │   schema-registry <topic>-value │   KRaft cluster       │                  │ master+2 W   │
-└─────────────┘                                 └──────────────────────┘                  └──────┬───────┘
-      │  register / encode                              ▲                                        │ foreachBatch
-      ▼                                                 │ fetch schema / decode                      ▼
-┌──────────────────┐                                   │                              ┌────────────────────┐
-│ schema-registry   │ ◄────────────────────────────────┘                ┌───┐          │ MongoDB 3-node rs0   │
-└──────────────────┘                                                   │Spark│◄────────│  mongodb1/2/3 (users) │
-                                                                       └────┘ write     └────────────────────┘
-```
-
 **The flow at a glance:**
 
 1. A **Python operator** in Airflow fetches a random user from `randomuser.me`, maps it onto the Avro schema, and publishes it to the Kafka topic `users_created` (encoded Avro, wired with the Confluent magic-byte header).
@@ -122,7 +106,6 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 python -c "import secrets; print(secrets.token_hex(32))"                                     # JWT / API secrets
 ```
 
-> ⚠️ `.env` is **gitignored** — never commit it.
 
 | Variable | Description |
 |----------|-------------|
@@ -136,17 +119,11 @@ python -c "import secrets; print(secrets.token_hex(32))"                        
 
 ### 2️⃣ Start the stack
 
-The `airflow-worker` image expects a local PySpark wheel (gitignored, it's ~430 MB). Fetch it once before the first build:
 
-```bash
-./airflow/worker/download-pyspark-wheel.sh
-```
 
 ```bash
 docker compose up -d --build
 ```
-
-Wait until everything is healthy:
 
 ```bash
 docker compose ps
@@ -226,51 +203,6 @@ Topology and behavior are configurable via `.env` (injected by `compose.yml`):
 
 > Airflow settings are passed as `AIRFLOW__<SECTION>__<KEY>` environment variables (taking precedence over `config/airflow.cfg`) — see `compose.yml` for the full list.
 
----
-
-## 🧹 Resetting the Data
-
-Start fresh (empty Kafka topic + empty MongoDB):
-
-```bash
-# 1. Stop the running pipeline (Airflow UI → mark spark_consumer as failed)
-
-# 2. Empty MongoDB
-docker compose exec mongodb1 mongosh \
-  "mongodb://$MONGO_ROOT_USERNAME:$MONGO_ROOT_PASSWORD@mongodb1:27017,mongodb2:27017,mongodb3:27017/users_db?replicaSet=rs0&authSource=admin" \
-  --eval "db.users.drop()"
-
-# 3. Delete + recreate the Kafka topic (deletion is async — wait for it to disappear)
-docker compose exec kafka1 kafka-topics --bootstrap-server broker1:9092,broker2:9092 \
-  --delete --topic users_created
-docker compose exec kafka1 kafka-topics --bootstrap-server broker1:9092,broker2:9092 \
-  --create --topic users_created --partitions 1 --replication-factor 2 --config min.insync.replicas=2
-
-# 4. Clear Spark checkpoints so offsets restart from the beginning
-rm -rf logs-worker1/spark-checkpoints/users logs-worker2/spark-checkpoints/users
-```
-
-**Nuclear option** — wipe everything (Airflow metadata, Kafka data, all volumes), **without** removing images or the build cache:
-
-```bash
-docker compose down -v
-```
-
-> ✅ No re-install of PySpark or rebuild of the Dockerfiles is needed to come back up.
-
----
-
-## 🔍 Troubleshooting
-
-| Symptom | Fix |
-|---------|-----|
-| **Consumer never picks up data / resumes from an old offset** | Clear Spark checkpoints (`logs-worker1/spark-checkpoints/users`, `logs-worker2/spark-checkpoints/users`) so the stream restarts from `earliest`. |
-| **Streaming query fails after a code change ("schema mismatch")** | The checkpoint stores the query schema — clear checkpoints before re-running with changed job logic. |
-| **Kafka topic delete "didn't work"** | Deletion is asynchronous in KRaft — wait a few seconds, confirm with `kafka-topics --list`, then recreate. |
-| **MongoDB writes fail** | The Spark writer needs the replica set **primary**. The `MONGO_URI` seed list auto-discovers it — check health with `docker compose exec mongodb1 mongosh --eval "rs.status()"`. |
-| **Schema Registry subjects accumulate** | If the Avro schema changes incompatibly, delete the obsolete `users_created-value` subject (the image ships no `curl` — use `requests` from an Airflow container). |
-
----
 
 ## 📁 Project Structure
 
